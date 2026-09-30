@@ -1,0 +1,123 @@
+#!/bin/sh
+set -eu
+SD=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+ARTIFACT_DIR=${ARTIFACT_DIR:-"$SD/artifacts"}
+export ARTIFACT_DIR
+fail() { printf 'DEPLOY_FAIL: %s %s\n' "$1" "$2" >&2; exit 1; }
+# total_install.sh（apt/dpkg 路线）— assemble_total.py 确定性生成，勿手改
+MODE=${1:-}
+case "$MODE" in ''|--dry-run|--rollback) ;; *) fail CONFIG_APPLY 'unknown option' ;; esac
+process_running() {
+  expected=$1
+  if ps -eww -o args= >/dev/null 2>&1; then
+    if ps -eww -o args= | awk -v expected="$expected" '
+      { command=$1; sub(/^.*\//, "", command); if (command == expected) found=1 }
+      END { exit !found }'; then return 0; fi
+    if ps -eo comm= | awk -v expected="$expected" '
+      { if ($1 == expected) found=1 } END { exit !found }'; then return 0; fi
+  fi
+  if command -v pgrep >/dev/null 2>&1 && pgrep -x "$expected" >/dev/null 2>&1; then
+    return 0
+  fi
+  for proc in /proc/[0-9]*; do
+    [ -r "$proc/comm" ] || continue
+    IFS= read -r comm < "$proc/comm" || :
+    [ "$comm" = "$expected" ] && return 0
+    [ -r "$proc/cmdline" ] || continue
+    first=$(tr '\000' '\n' < "$proc/cmdline" | sed -n '1p')
+    [ "${first##*/}" = "$expected" ] && return 0
+  done
+  return 1
+}
+java_process_running() {
+  expected=$1
+  if ps -eww -o args= >/dev/null 2>&1; then
+    if ps -eww -o args= | awk -v expected="$expected" '
+      { command=$1; sub(/^.*\//, "", command);
+        if (command == "java" && index($0, expected) > 0) found=1 }
+      END { exit !found }'; then return 0; fi
+  fi
+  for proc in /proc/[0-9]*; do
+    [ -r "$proc/comm" ] && [ -r "$proc/cmdline" ] || continue
+    IFS= read -r comm < "$proc/comm" || :
+    [ "$comm" = java ] || continue
+    cmd=$(tr '\000' ' ' < "$proc/cmdline")
+    # ES 8.19+ 主类以 JPMS 模块形式出现（server/org.elasticsearch.bootstrap.Elasticsearch，
+    # 前侧是 / 非空格），空格全词匹配会漏检——放宽为子串匹配（2026-09-30 实测）
+    case "$cmd" in *"$expected"*) return 0 ;; esac
+  done
+  return 1
+}
+check_service() {
+  case "$1" in
+@@COMPONENT_CHECK_SERVICE_CASES@@
+    *) : ;;
+  esac
+}
+run_install() {
+  slug=$1; shift
+  printf '[component] install %s begin\n' "$slug"
+  if sh "$SD/${slug}_install.sh" "$@"; then
+    if [ -z "$MODE" ]; then check_service "$slug"; fi
+    printf '[component] install %s ok\n' "$slug"
+  else
+    rc=$?
+    printf 'DEPLOY_FAIL: SERVICE_START install component %s exited %s\n' "$slug" "$rc" >&2
+    exit "$rc"
+  fi
+}
+if [ "$MODE" = --rollback ]; then
+@@COMPONENT_ROLLBACK_INSTALL_CALLS@@
+  exit 0
+fi
+if [ -z "$MODE" ]; then
+if [ ! -s "$ARTIFACT_DIR/MANIFEST.txt" ]; then
+  if [ -f "$SD/fetch-artifacts.tar.gz" ]; then
+    mkdir -p "$ARTIFACT_DIR"
+    listing=$(mktemp "${TMPDIR:-/tmp}/envprobe-tar.XXXXXX") || fail MANIFEST 'mktemp failed'
+    tar -tzf "$SD/fetch-artifacts.tar.gz" > "$listing" || fail MANIFEST 'archive listing failed'
+    while IFS= read -r member; do
+      case "$member" in
+        rpms|rpms/*|debs|debs/*|src|src/*|jdk|jdk/*|conf|conf/*|MANIFEST.txt) ;;
+        *) fail MANIFEST 'unsafe archive member path' ;;
+      esac
+      case "/$member/" in *'/../'*|*'/./'*) fail MANIFEST 'unsafe archive traversal' ;; esac
+    done < "$listing"
+    rm -f "$listing"
+    tar -xzf "$SD/fetch-artifacts.tar.gz" -C "$ARTIFACT_DIR" \
+      || fail MANIFEST 'archive extraction failed'
+  fi
+fi
+  [ -s "$ARTIFACT_DIR/MANIFEST.txt" ] || fail MISSING_ARTIFACT 'artifact bundle missing'
+  if [ -s "$ARTIFACT_DIR/MANIFEST.txt" ]; then
+    (cd "$ARTIFACT_DIR" && sha256sum -c MANIFEST.txt >/dev/null) \
+      || fail MANIFEST 'artifact checksum failed'
+  fi
+fi
+#@@BEGIN_TRANSACTION@@
+PACKAGE_NAMES='@@PACKAGE_NAMES@@'
+if [ "$MODE" != --dry-run ]; then
+  [ -s "$ARTIFACT_DIR/debs/Packages.gz" ] \
+    || fail REPO_METADATA 'local APT package index missing'
+  REPO=$(mktemp -d "${TMPDIR:-/tmp}/envprobe-apt-local.XXXXXX") \
+    || fail CONFIG_APPLY 'mktemp failed'
+  mkdir -p "$REPO/lists/partial" "$REPO/archive-partial"
+  printf 'deb [trusted=yes] file:%s ./\n' "$ARTIFACT_DIR/debs" > "$REPO/sources.list"
+  apt_options() {
+    apt-get -o Dir::Etc::sourcelist="$REPO/sources.list" \
+      -o Dir::Etc::sourceparts=- -o Dir::State::lists="$REPO/lists" \
+      -o Dir::Cache::archives="$ARTIFACT_DIR/debs" \
+      -o Dir::Cache::archives::partial="$REPO/archive-partial" \
+      -o APT::Keep-Downloaded-Packages=true "$@"
+  }
+  apt_options update || fail APT_SOLVE 'offline local APT index is not readable'
+  # All planned names and dependency .debs are in the local index; network downloads are disabled.
+  # shellcheck disable=SC2086
+  apt_options --no-download --no-install-recommends -y install $PACKAGE_NAMES \
+    || fail APT_SOLVE 'offline local APT install failed'
+  rm -rf "$REPO"
+fi
+#@@END_TRANSACTION@@
+@@COMPONENT_INSTALL_CALLS@@
+@@COMPONENT_CHECK_SERVICE_BLOCK@@
+@@SUMMARY_LINES@@

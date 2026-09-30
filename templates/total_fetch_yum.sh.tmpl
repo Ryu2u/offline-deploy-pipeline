@@ -1,0 +1,390 @@
+#!/bin/sh
+set -eu
+SD=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+ARTIFACT_DIR=${ARTIFACT_DIR:-"$SD/artifacts"}
+export ARTIFACT_DIR
+fail() { printf 'DEPLOY_FAIL: %s %s\n' "$1" "$2" >&2; exit 1; }
+# total_fetch.sh（yum/dnf 路线）— assemble_total.py 确定性生成，勿手改
+MODE=${1:-}
+case "$MODE" in ''|--finalize-only|--dry-run|--rollback) ;; *) fail CONFIG_APPLY 'unknown option' ;; esac
+mkdir -p "$ARTIFACT_DIR/rpms" "$ARTIFACT_DIR/debs" "$ARTIFACT_DIR/src" "$ARTIFACT_DIR/jdk" "$ARTIFACT_DIR/conf"
+run_fetch() {
+  slug=$1; shift
+  printf '[component] fetch %s begin\n' "$slug"
+  if sh "$SD/${slug}_fetch.sh" "$@"; then
+    printf '[component] fetch %s ok\n' "$slug"
+  else
+    rc=$?
+    printf 'DEPLOY_FAIL: CONFIG_APPLY fetch component %s exited %s\n' "$slug" "$rc" >&2
+    exit "$rc"
+  fi
+}
+if [ "$MODE" = --rollback ]; then
+@@COMPONENT_ROLLBACK_FETCH_CALLS@@
+  exit 0
+fi
+if [ "$MODE" != --finalize-only ]; then
+@@COMPONENT_FETCH_CALLS@@
+fi
+[ "$MODE" = --dry-run ] && exit 0
+#@@BEGIN_CLOSURE@@
+RPM_PACKAGES='@@RPM_PACKAGES@@'
+TARGET_RELEASEVER='@@TARGET_RELEASEVER@@'
+command -v yum >/dev/null 2>&1 || fail YUM_SOLVE 'yum unavailable for RPM closure'
+command -v curl >/dev/null 2>&1 || fail YUM_SOLVE 'curl unavailable for repo mirror'
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/envprobe-fetch.XXXXXX") || fail CONFIG_APPLY 'mktemp failed'
+trap 'rm -rf "$WORK"' 0
+trap 'exit 1' 1 2 3 15
+mkdir -p "$WORK/repos-local" "$WORK/installroot"
+# 仓库本地化：CDN 可能对 librepo 的元数据请求稳定 403 而对 curl 放行
+# （实测 aliyun 对 updateinfo/modules 两类文件），死源或组件遗留的坏源
+# 也会拖垮整个闭包求解。先用 curl 把每个 repo 段的 repodata 完整镜像到
+# 本地，yum 只读 file:// 镜像；任一文件拉不动的段剔除并告警。
+ARCH=$(uname -m)
+: > "$WORK/repourls"
+SKIPPED_REPOS=''
+primary_href() {
+  sed 's/></>\n</g' "$1" |
+    sed -n '/<data type="primary"/,/<\/data>/s|.*<location href="repodata/\([^"/]*\)".*|\1|p' | head -1
+}
+primary_db_href() {
+  sed 's/></>\n</g' "$1" |
+    sed -n '/<data type="primary_db"/,/<\/data>/s|.*<location href="repodata/\([^"/]*\)".*|\1|p' | head -1
+}
+valid_repodata_href() {
+  case "$1" in
+    ''|.|..|[!A-Za-z0-9]*|*[!A-Za-z0-9._+-]*) return 1 ;;
+  esac
+  return 0
+}
+primary_field() {
+  awk -v tag="$2" '
+    /<data type="primary"/ { in_primary=1; next }
+    in_primary && index($0, "<" tag) {
+      value=$0
+      sub(".*<" tag "[^>]*>", "", value)
+      sub("</" tag ">.*", "", value)
+      print value
+      exit
+    }
+    in_primary && index($0, "</data>") { exit }
+  ' "$1"
+}
+refresh_primary_repodata() {
+  repomd=$1
+  primary=$2
+  open_primary=$3
+  baseurl=$4
+  primary_db=$(primary_db_href "$repomd")
+  if [ -n "$primary_db" ]; then
+    valid_repodata_href "$primary_db" || return 1
+    primary_basename=$(basename "$primary") || return 1
+    [ "$primary_db" != "$primary_basename" ] || return 1
+  fi
+  case "$primary" in
+    *.gz) gzip -t "$primary" || return 1
+      gzip -dc "$primary" > "$open_primary.raw" || return 1 ;;
+    # EPEL8 等 el8 后期仓库 primary 用 xz 压缩（2026-09-30 实测）
+    *.xz) command -v xz >/dev/null 2>&1 || return 1
+      xz -t "$primary" || return 1
+      xz -dc "$primary" > "$open_primary.raw" || return 1 ;;
+    *) return 1 ;;
+  esac
+  sed -e 's/></>\n</g' \
+    -e "/<location / { /xml:base[[:space:]]*=/! s|<location |<location xml:base=\"$baseurl/\" |g; }" \
+    "$open_primary.raw" > "$open_primary" \
+    || { rm -f "$open_primary.raw"; return 1; }
+  rm -f "$open_primary.raw" || return 1
+  case "$primary" in
+    *.xz) xz -c "$open_primary" > "$primary.tmp" || return 1 ;;
+    *) gzip -c "$open_primary" > "$primary.tmp" || return 1 ;;
+  esac
+  mv "$primary.tmp" "$primary" || return 1
+  primary_checksum=$(sha256sum "$primary" | awk '{print $1}') || return 1
+  primary_size=$(wc -c < "$primary" | tr -d '[:space:]')
+  primary_open_checksum=$(sha256sum "$open_primary" | awk '{print $1}') || return 1
+  primary_open_size=$(wc -c < "$open_primary" | tr -d '[:space:]')
+  normalized="$repomd.normalized"
+  sed 's/></>\n</g' "$repomd" > "$normalized" || return 1
+  awk -v checksum="$primary_checksum" -v open_checksum="$primary_open_checksum" \
+      -v size="$primary_size" -v open_size="$primary_open_size" '
+    /<data type="primary_db"/ { in_primary_db=1; next }
+    in_primary_db {
+      if (/<\/data>/) in_primary_db=0
+      next
+    }
+    /<data type="primary"/ { in_primary=1; checksum_done=0; open_checksum_done=0; size_done=0 }
+    in_primary && /<location / {
+      print "    <checksum type=\"sha256\">" checksum "</checksum>"
+      print "    <open-checksum type=\"sha256\">" open_checksum "</open-checksum>"
+      checksum_done=1; open_checksum_done=1
+      print
+      next
+    }
+    in_primary && /<checksum/ { next }
+    in_primary && /<open-checksum/ { next }
+    in_primary && /<size/ { next }
+    in_primary && /<open-size/ { next }
+    in_primary && /<timestamp/ {
+      print
+      print "    <size>" size "</size>"
+      print "    <open-size>" open_size "</open-size>"
+      size_done=1
+      next
+    }
+    in_primary && /<\/data>/ {
+      if (!checksum_done) print "    <checksum type=\"sha256\">" checksum "</checksum>"
+      if (!open_checksum_done) print "    <open-checksum type=\"sha256\">" open_checksum "</open-checksum>"
+      if (!size_done) {
+        print "    <size>" size "</size>"
+        print "    <open-size>" open_size "</open-size>"
+      }
+      print
+      in_primary=0
+      next
+    }
+    { print }
+  ' "$normalized" > "$repomd.tmp" || { rm -f "$normalized"; return 1; }
+  rm -f "$normalized" || return 1
+  mv "$repomd.tmp" "$repomd" || return 1
+  if [ -n "$primary_db" ]; then
+    if awk -v target="$primary_db" '
+      /<location / {
+        value=$0
+        sub(".*href=\"", "", value)
+        sub("\".*", "", value)
+        n=split(value, path, "/")
+        if (path[n] == target) found=1
+      }
+      END { if (found) exit 0; exit 1 }
+    ' "$repomd"; then
+      return 1
+    else
+      remaining_status=$?
+      [ "$remaining_status" -eq 1 ] || return 1
+    fi
+    repomd_dir=$(dirname "$repomd") || return 1
+    rm -f "$repomd_dir/$primary_db" || return 1
+  fi
+  [ "$(primary_field "$repomd" checksum)" = "$primary_checksum" ] \
+    && [ "$(primary_field "$repomd" open-checksum)" = "$primary_open_checksum" ] \
+    && [ "$(primary_field "$repomd" size)" = "$primary_size" ] \
+    && [ "$(primary_field "$repomd" open-size)" = "$primary_open_size" ]
+}
+register_repo_section() {
+  [ -n "$section" ] && [ "$section_enabled" = 1 ] && [ -n "$section_urls" ] || return 0
+  printf '%s\n' "$section_urls" > "$WORK/repo-section-urls"
+  while IFS= read -r rawurl; do
+    [ -n "$rawurl" ] || continue
+    url=$(printf '%s' "$rawurl" | sed -e "s|\$basearch|$ARCH|g" -e "s|\$arch|$ARCH|g" -e "s|\$releasever|$TARGET_RELEASEVER|g")
+    case "$url" in
+      http://*|https://*)
+        printf '%s %s\n' "$section" "$url" >> "$WORK/repourls"
+        case "$url" in
+          */AppStream/*)
+            burl=$(printf '%s' "$url" | sed 's|/AppStream/|/BaseOS|')
+            [ "$burl" != "$url" ] && printf '%s-baseos %s\n' "$section" "$burl" >> "$WORK/repourls" ;;
+        esac ;;
+      file:///*)
+        med=${url#file://}
+        [ -d "$med" ] || continue
+        d="$WORK/mirror/$section/repodata"
+        mkdir -p "$d"
+        if [ ! -f "$med/repodata/repomd.xml" ] || ! cp -R "$med/repodata/." "$d/"; then
+          SKIPPED_REPOS="$SKIPPED_REPOS $section(file-repodata-missing)"
+          rm -rf "$WORK/mirror/$section"
+          continue
+        fi
+        href=$(primary_href "$d/repomd.xml")
+        if [ -z "$href" ] || ! valid_repodata_href "$href"; then
+          SKIPPED_REPOS="$SKIPPED_REPOS $section(file-repodata-href-invalid)"
+          rm -rf "$WORK/mirror/$section"
+          continue
+        fi
+        p="$d/$href"
+        if [ ! -f "$p" ] || \
+           ! refresh_primary_repodata "$d/repomd.xml" "$p" "$WORK/primary-open-$section.xml" "$url"; then
+          SKIPPED_REPOS="$SKIPPED_REPOS $section(file-primary-inconsistent)"
+          rm -rf "$WORK/mirror/$section"
+          continue
+        fi
+        printf '[envprobe-%s]\nname=%s\nbaseurl=file://%s/mirror/%s\nenabled=1\ngpgcheck=0\nmodule_hotfixes=1\n' \
+          "$section" "$section" "$WORK" "$section" > "$WORK/repos-local/$section.repo" ;;
+    esac
+  done < "$WORK/repo-section-urls"
+}
+for repo in /etc/yum.repos.d/*.repo "$ARTIFACT_DIR"/conf/*/*.repo; do
+  [ -f "$repo" ] || continue
+  section=''
+  section_enabled=1
+  section_urls=''
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      \[*\])
+        register_repo_section
+        section=$(printf '%s' "$line" | tr -d '[]')
+        section_enabled=1
+        section_urls=''
+        case "$section" in
+          ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*)
+            section=''
+            section_enabled=0
+            SKIPPED_REPOS="$SKIPPED_REPOS invalid-repo-section" ;;
+        esac ;;
+      *=*)
+        repo_key=$(printf '%s' "$line" | sed 's/=.*//' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
+        repo_value=$(printf '%s' "$line" | sed 's/^[^=]*=//' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr -d '\r')
+        case "$repo_key" in
+          enabled)
+            enabled_value=$(printf '%s' "$repo_value" | tr '[:upper:]' '[:lower:]')
+            case "$enabled_value" in
+              0|false|no) section_enabled=0 ;;
+              1|true|yes) section_enabled=1 ;;
+            esac ;;
+          baseurl)
+            [ -n "$section" ] || continue
+            if [ -n "$section_urls" ]; then
+              section_urls="$section_urls
+$repo_value"
+            else
+              section_urls=$repo_value
+            fi ;;
+        esac ;;
+    esac
+  done < "$repo"
+  register_repo_section
+done
+: > "$WORK/mirrored"
+while read -r key url; do
+  [ -d "$WORK/mirror/$key" ] && continue
+  d="$WORK/mirror/$key/repodata"
+  mkdir -p "$d"
+  if ! curl -fsSL --max-time 60 -o "$d/repomd.xml" "$url/repodata/repomd.xml"; then
+    # 逐段刷屏会把真正的 yum 求解错误挤出验收失败尾部（修复循环就看不到根因），
+    # 只累计，闭包求解前汇总一行
+    SKIPPED_REPOS="$SKIPPED_REPOS $key(repomd-unreachable)"
+    rm -rf "$WORK/mirror/$key"
+    continue
+  fi
+  complete=1
+  for href in $(sed 's/></>\n</g' "$d/repomd.xml" | sed -n 's/.*href="repodata\/\([^"]*\)".*/\1/p' | sort -u); do
+    valid_repodata_href "$href" || { complete=0; break; }
+    curl -fsSL --max-time 180 -o "$d/$href" "$url/repodata/$href" || { complete=0; break; }
+  done
+  if [ "$complete" -ne 1 ]; then
+    SKIPPED_REPOS="$SKIPPED_REPOS $key(metadata-incomplete)"
+    rm -rf "$WORK/mirror/$key"
+    continue
+  fi
+  # 元数据本地化但 RPM 下载仍回源。只重写 primary 并同步更新四项摘要/大小；
+  # 其他 repomd 条目保持原校验值。组件 file:// repo 使用同一临时副本修复流程。
+  href=$(primary_href "$d/repomd.xml")
+  p="$d/$href"
+  if [ -z "$href" ] || [ ! -f "$p" ] || \
+     ! refresh_primary_repodata "$d/repomd.xml" "$p" "$WORK/primary-open-$key.xml" "$url"; then
+    SKIPPED_REPOS="$SKIPPED_REPOS $key(primary-metadata-invalid)"
+    rm -rf "$WORK/mirror/$key"
+    continue
+  fi
+  # module_hotfixes：上游 el8 仓库的模块包（mysql-server/nginx/redis…）依赖
+  # platform:el8 流，目标机(如 Kylin el10)的 dnf 会整段过滤掉；按普通包求解。
+  printf '[envprobe-%s]\nname=%s (mirrored)\nbaseurl=file://%s/mirror/%s\nenabled=1\ngpgcheck=0\nmodule_hotfixes=1\n' \
+      "$key" "$key" "$WORK" "$key" > "$WORK/repos-local/$key.repo"
+  printf 'x\n' >> "$WORK/mirrored"
+  printf '[closure] mirrored repo %s from %s\n' "$key" "$url"
+done < "$WORK/repourls"
+[ -s "$WORK/mirrored" ] || [ -n "$(find "$WORK/repos-local" -name '*.repo' -print -quit)" ] \
+  || fail YUM_SOLVE 'no reachable yum repository sources'
+printf '[main]\ncachedir=%s\nreposdir=%s\nkeepcache=0\ngpgcheck=0\n' \
+  "$WORK/cache" "$WORK/repos-local" > "$WORK/yum.conf"
+# Package names are validated Java-side before insertion; splitting is intentional.
+# shellcheck disable=SC2086
+# 空安装根探测不到平台模块流（"No valid Platform ID"），跨 el8 上游求解需显式
+# 声明；仅 dnf4 支持 module_platform_id，老 yum3（CentOS7）跳过。弱依赖默认关
+# 闭：离线交付只需强依赖闭包，弱依赖会把字体/GTK 全家桶翻几倍。
+MODULE_PLATFORM_SET=
+yum --version 2>/dev/null | head -1 | grep -q "dnf\|^4\." && MODULE_PLATFORM_SET="--setopt=module_platform_id=platform:el8"
+CLOSURE_LOG="$WORK/closure.log"
+[ -n "$SKIPPED_REPOS" ] && printf '[closure] skipped repos:%s\n' "$SKIPPED_REPOS" >&2
+closure_run() {
+  yum -c "$WORK/yum.conf" --installroot="$WORK/installroot" \
+    --releasever="$TARGET_RELEASEVER" $MODULE_PLATFORM_SET \
+    --setopt=install_weak_deps=False --downloadonly \
+    --downloaddir="$ARTIFACT_DIR/rpms" -y install $RPM_PACKAGES >>"$CLOSURE_LOG" 2>&1
+}
+closure_run || {
+  # CDN 对 librepo 的下载请求可能间歇 403（同 URL curl 放行）：抽取失败 URL
+  # 用 curl 补下后重跑。每轮通常仅 1-3 个包失败，实测几十轮内收敛；
+  # 25 轮仍不收敛视为网络不可用。
+  rescued=1
+  attempt=0
+  while [ "$rescued" -gt 0 ] && [ "$attempt" -lt 25 ]; do
+    attempt=$((attempt+1))
+    rescued=0
+    for u in $(grep -oE "https?://[^ ]+\.rpm" "$CLOSURE_LOG" | sort -u); do
+      if curl -fsSL --retry 3 --max-time 180 -o "$ARTIFACT_DIR/rpms/$(basename "$u")" "$(printf '%s' "$u" | sed 's/%2b/+/g')"; then
+        rescued=$((rescued+1))
+      fi
+    done
+    [ "$rescued" -gt 0 ] && closure_run && break
+  done
+  closure_run || { tail -30 "$CLOSURE_LOG" >&2; fail YUM_SOLVE 'empty-installroot RPM closure failed'; }
+}
+if command -v createrepo_c >/dev/null 2>&1; then
+  createrepo_c "$ARTIFACT_DIR/rpms" || fail REPO_METADATA 'createrepo_c failed'
+elif command -v createrepo >/dev/null 2>&1; then
+  createrepo "$ARTIFACT_DIR/rpms" || fail REPO_METADATA 'createrepo failed'
+else
+  yum -c "$WORK/yum.conf" -y install createrepo_c \
+    || yum -c "$WORK/yum.conf" -y install createrepo \
+    || fail REPO_METADATA 'createrepo unavailable'
+  if command -v createrepo_c >/dev/null 2>&1; then
+    createrepo_c "$ARTIFACT_DIR/rpms" || fail REPO_METADATA 'createrepo_c failed'
+  else
+    createrepo "$ARTIFACT_DIR/rpms" || fail REPO_METADATA 'createrepo failed'
+  fi
+fi
+[ -f "$ARTIFACT_DIR/rpms/repodata/repomd.xml" ] \
+  || fail REPO_METADATA 'repodata missing'
+#@@END_CLOSURE@@
+if [ -z "$(find "$ARTIFACT_DIR/rpms" "$ARTIFACT_DIR/debs" "$ARTIFACT_DIR/src" "$ARTIFACT_DIR/jdk" "$ARTIFACT_DIR/conf" -type f -print -quit)" ]; then
+  fail MISSING_ARTIFACT 'planned artifacts were not produced'
+fi
+artifact_root=$(cd "$ARTIFACT_DIR" && pwd -P) || fail MANIFEST 'artifact root unavailable'
+find "$ARTIFACT_DIR/rpms" "$ARTIFACT_DIR/debs" "$ARTIFACT_DIR/src" "$ARTIFACT_DIR/jdk" "$ARTIFACT_DIR/conf" -type l -print |
+  while IFS= read -r link; do
+    target=$(readlink "$link") || exit 1
+    case "$target" in /*) exit 1 ;; esac
+    resolved=$(realpath -m "$link") || exit 1
+    case "$resolved" in "$artifact_root"/*) ;; *) exit 1 ;; esac
+  done || fail MANIFEST 'unsafe artifact symlink'
+(cd "$ARTIFACT_DIR" &&
+  find rpms debs src jdk conf -type f -print | LC_ALL=C sort |
+  while IFS= read -r file; do sha256sum "$file"; done
+) > "$ARTIFACT_DIR/MANIFEST.txt" || fail MANIFEST 'hash generation failed'
+[ -s "$ARTIFACT_DIR/MANIFEST.txt" ] || fail MANIFEST 'empty manifest'
+(cd "$ARTIFACT_DIR" && sha256sum -c MANIFEST.txt >/dev/null) \
+  || fail MANIFEST 'manifest validation failed'
+tar -czf "$SD/fetch-artifacts.tar.gz" -C "$ARTIFACT_DIR" \
+  rpms debs src jdk conf MANIFEST.txt || fail MANIFEST 'archive creation failed'
+members=$(mktemp "${TMPDIR:-/tmp}/envprobe-members.XXXXXX") || fail MANIFEST 'mktemp failed'
+expected=$(mktemp "${TMPDIR:-/tmp}/envprobe-expected.XXXXXX") || fail MANIFEST 'mktemp failed'
+@@TRAP_LINE@@
+tar -tzf "$SD/fetch-artifacts.tar.gz" | sed '/\/$/d' | LC_ALL=C sort > "$members" \
+  || fail MANIFEST 'archive listing failed'
+(cd "$ARTIFACT_DIR" &&
+  find rpms debs src jdk conf \( -type f -o -type l \) -print && printf 'MANIFEST.txt\n'
+) | LC_ALL=C sort > "$expected" || fail MANIFEST 'expected member listing failed'
+expected_hash=$(sha256sum "$expected" | awk '{print $1}')
+actual_hash=$(sha256sum "$members" | awk '{print $1}')
+if [ "$expected_hash" != "$actual_hash" ]; then
+  printf 'expected_count=%s archive_count=%s\n' \
+    "$(wc -l < "$expected")" "$(wc -l < "$members")" >&2
+  awk 'NR==FNR { seen[$0]=1; next } !($0 in seen) { print "extra " $0 }' \
+    "$expected" "$members" | sed -n '1,20p' >&2
+  awk 'NR==FNR { seen[$0]=1; next } !($0 in seen) { print "missing " $0 }' \
+    "$members" "$expected" | sed -n '1,20p' >&2
+  fail MANIFEST 'archive member set mismatch'
+fi
+printf 'Deliver fetch-artifacts.tar.gz and the complete script bundle together.\n'
+@@SUMMARY_LINES@@

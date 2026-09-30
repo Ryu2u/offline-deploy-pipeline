@@ -1,0 +1,239 @@
+# EnvProbe OS Gotchas 知识库
+#
+# 用途：AI 部署脚本生成时按目标 OS 命中注入 prompt 上下文（计划 §6.3）。
+# 每条 = 一个实战验证过的事实/坑。新增条目须经双容器实证（docs/reports/ 有对应报告）。
+# 版本：kb_version 随内容演进，注入 prompt 时携带以便审计。
+
+kb_version: 2026.09.28.4
+
+entries:
+  - id: centos7-aarch64-package-availability
+    match: { os_id: [centos, rhel], os_version_range: ">=7,<8", arch: [aarch64, arm64], package_manager: [yum] }
+    topic: package-source
+    title: aarch64 的 el7 仓库内容远少于 x86_64——nginx 缺位与实测替代源
+    facts:
+      - "vault altarch/7.9.2009 的 os/updates/extras/aarch64 三仓库均无 nginx（x86_64 的 extras 有 nginx-1.20.1；aarch64 extras 是精简仓库）"
+      - "vault 只保留 7.9.2009：按 7.2.1511/7.1603 等历史 point release 枚举目录一律 403，禁止遍历历史小版本"
+      - "nginx 唯一可用来源=EPEL7 官方归档 https://archives.fedoraproject.org/pub/archive/epel/7/aarch64/Packages/n/（实测 nginx-1.12.2-3.el7.aarch64.rpm 在）"
+      - "MySQL 8 官方源对 el7 已整体下架：repo.mysql.com/yum/mysql-8.0-community/el/7/{x86_64,aarch64}/repodata/repomd.xml 均 404（目录页 200 是 CDN 残影）；aarch64 官方 tarball 最低要求 glibc 2.28（el7 仅 2.17），cdn.mysql.com 无 glibc2.17-aarch64 组合——**el7 aarch64 上 MySQL 8 官方不可得**，MariaDB 官方 centos7-aarch64 源亦已全部下架（dlm/mirror/yum.mariadb.org 的 10.x 路径均 404）"
+      - "mariadb-server 仅 vault os 有 5.5.68-1.el7.aarch64（进程名 mysqld、mysqladmin ping 可用，满足 mysql 类需求）；java 最高 1.8.0（openjdk-1.8.0-262.b10）——JDK 21 必须走上游 tarball（Temurin aarch64）放 ARTIFACT_DIR/jdk/"
+    guidance: aarch64 目标规划段必须按上述实测可得清单选源：nginx 走 EPEL 归档、mysql 类需求走 vault os 的 mariadb-server（无版本硬性要求时不得选 MySQL 8 官方源——已全线下架）、jdk8 走 vault os、JDK 21 走 Temurin tarball；禁止在 vault 历史小版本目录或已下架的官方源重试
+    evidence: 本机 docker centos:7(arm64) 验收实测 2026-09-28（脚本#58 v1-v3：nginx 幻觉版本 404、MariaDB 官方源 404、vault 历史版本目录 403）
+
+  - id: centos7-vault-mirror-structure
+    match: { os_id: [centos, rhel], os_version_range: ">=7,<8", package_manager: [yum] }
+    topic: package-source
+    title: CentOS 7 官方源已归档，vault 目录结构易写错
+    facts:
+      - "mirrorlist 已死，必须用 vault.centos.org；repo 文件需 sed 替换 mirrorlist→vault baseurl"
+      - "x86_64 路径: vault.centos.org/7.9.2009/os/x86_64/Packages/"
+      - "aarch64 路径: vault.centos.org/altarch/7.9.2009/os/aarch64/Packages/（架构层在 os 之下，与直觉相反）"
+      - "updates 包在 altarch/7.9.2009/updates/aarch64/Packages/"
+    guidance: fetch 脚本的下载源 URL 必须按上述模板拼接；容器内验证 HTTP 200 后再写入
+    evidence: docs/reports/pair-script-offline-e2e-20260922.md 缺陷 D1
+
+  - id: centos7-plus-package-url-and-dirs
+    match: { os_id: [centos, rhel], os_version_range: ">=7,<8", package_manager: [yum] }
+    topic: package-source
+    title: 含加号包名（libstdc++）的下载陷阱与 os/updates 双目录查找
+    facts:
+      - "libstdc++/libstdc++-devel 等包在 os/aarch64/Packages/ 目录（不在 updates）——依赖查找必须同时索引 os 与 updates 两个目录"
+      - "URL 中加号必须编码为 %2B：libstdc%2B%2B-4.8.5-44.el7.aarch64.rpm（未编码的 ++ 会被服务器按空格处理返回 404）"
+      - "本地目录索引匹配包名含正则元字符（+）时用 grep -F 字面匹配"
+    guidance: fetch 脚本下载 rpm 时遍历 os 与 updates 两个索引；拼 URL 时对包名做 URL 编码（至少替换 + 为 %2B）；匹配索引用 grep -F
+    evidence: 用户外网 fetch 实测 2026-09-23（libstdc++ 未找到）
+
+  - id: rpm-version-must-resolve-from-index
+    match: { os_family: linux, package_manager: [yum] }
+    topic: package-source
+    title: 严禁凭记忆硬编码 rpm 精确版本号——必须从仓库索引解析
+    facts:
+      - "AI 记忆的版本号幻觉率高：实测生成 kernel-headers-3.10.0-1160（把内核版本错当 headers 包版本），vault 实际为 4.18.0 系；glibc-headers 317 亦已过时（实际最新 326.el7_9.3）"
+      - "el7 的 kernel-headers 包版本与内核版本（3.10.0）完全无关，是独立演进的 4.18.0 系"
+      - "同名包在 os 与 updates 目录各有多个版本，updates 含 el7_9 后缀补丁版"
+    guidance: fetch 脚本的 RPM_LIST 只写包名（不含版本），运行时从 vault os+updates 索引解析最新版本再下载；解析不到才报错人工介入。若流程要求固定版本，版本清单必须来自真实索引输出而非生成时记忆
+    evidence: remote7 外网 fetch 实测 2026-09-23（kernel-headers 幻觉致 die）
+
+  - id: corelib-version-match-target-baseline
+    match: { os_family: linux, package_manager: [yum] }
+    topic: closure-resolution
+    title: 闭包版本由 yum 对空 rpmdb 求解，禁止手工 pin 回画像基线
+    facts:
+      - "手工把 glibc/openssl-libs pin 回目标画像的旧版本，会与闭包内其它包的精确版本要求互相矛盾，反而制造缺口（实测：任务 #49 候选 v2/v3 因此失败）"
+      - "空 installroot 求解得到的闭包自带一致性（含 glibc↔glibc-common 配对、openssl↔openssl-libs 配对），人工增删替换会破坏它"
+      - "核心库该不该升级由安装时的 yum 事务决定：已装且满足要求的包 yum 不动；确有包要求换版本才升级（实测只 Dependency Updated: openssl-libs）"
+    guidance: fetch 一律用「空 installroot + --downloadonly」产出闭包并原样交付，不得手工增删/替换/改版本；需要判定核心包是否被升级就读 yum 事务摘要，不要改写闭包
+    evidence: docs/reports/centos7-yum-localrepo-closure-20260925.md §1/§5
+
+  - id: one-shot-install-hardrules
+    match: { os_family: linux, package_manager: [yum] }
+    topic: install-idempotency
+    title: 一键安装硬规则（rpm 事务必须交给目标机 yum 求解）
+    facts:
+      - "install 的 rpm 安装严禁自建 rpm -Uvh 事务：基础镜像/存量系统自带精确版本锁定包（libxml2-python 要求 libxml2 = 2.9.1-6.el7.5、rpm-python 要求 rpm = 4.11.3-45.el7），全量 -Uvh 会把锁定依赖方一并打断，整事务失败（实测退出码 157）"
+      - "把整份闭包当显式参数交给 yum localinstall 同样失败：命令行参数被当作「必须升到该版本」，仍会强升 libxml2"
+      - "正确形态：fetch 生成 rpms/repodata（createrepo），install 把 rpms/ 当本地仓库、只声明目标包名，由 yum 求解升级面：yum -c <yum.conf> --disablerepo='*' --enablerepo=<本地仓库> --nogpgcheck -y install <目标包>"
+      - "禁止 --nodeps/--force/--skip-broken：它们把缺口藏起来，现场才爆"
+    guidance: fetch 闭包用空 installroot 真解析并 createrepo；install 只声明目标包名交由 yum 求解；禁止自建 rpm -Uvh 事务与逐包 rpm -ivh
+    evidence: docs/reports/centos7-yum-localrepo-closure-20260925.md §1/§2
+
+  - id: mariadb-centos7-openssl-glibc-matrix
+    match: { os_id: [centos, rhel], os_version_range: ">=7,<8", package_manager: [yum] }
+    topic: mariadb
+    title: MariaDB 在 CentOS 7 的版本选择矩阵（openssl/glibc 双约束）
+    facts:
+      - "MariaDB 官方 centos7 channel（10.x，≤10.11）链接系统 openssl 1.0.2k 系列（libssl.so.10），闭包只需 el7_9 补丁升级，无跨版本手术"
+      - "el8/el9/通用构建的 MariaDB（11.x 等）在 el7 上的第一阻塞是 glibc（要求 GLIBC_2.27~2.34，el7 只有 2.17），比 openssl 冲突更早暴露，且 glibc 不可单独升级"
+      - "MariaDB archive 源 URL 结构: archive.mariadb.org/mariadb-<版本>/yum/centos7-<架构>/rpms/（目录有 mariadb- 前缀，repo baseurl 易写错成无前缀）"
+      - "archive 源元数据可能陈旧：yumdownloader 报 'Package does not match intended download' 时用 curl 直下 rpms/ 目录绕开"
+    guidance: CentOS 7 目标选 mariadb-10.6/10.11 的 centos7-aarch64/amd64 channel；禁止 el8/el9/通用构建；openssl 冲突的本质是选错 channel
+    evidence: docs/reports/pair-script-offline-e2e-20260922.md §8
+
+  - id: yum-downloadonly-skips-target
+    match: { os_family: linux, package_manager: [yum] }
+    topic: closure-resolution
+    title: 空 installroot 的 --downloadonly 会把命令行目标包一并下载
+    facts:
+      - "更正旧结论：yum --installroot=<空目录> --downloadonly --downloaddir=X install <pkg> 会把 <pkg> 本身连同依赖一起落盘（实测 5 个目标包共 157 个 rpm，目标包全部在内）"
+      - "旧结论「目标包不在产物中」来自未用空 installroot / 用索引查询的场景，不适用于本流程"
+    guidance: 不要另写「yumdownloader 补包 / 索引直下 / 二段式补目标包」逻辑——手工补包正是缺口与版本错配的来源；闭包解析完只需校验目标包存在
+    evidence: docs/reports/centos7-yum-localrepo-closure-20260925.md §1
+
+  - id: rpm-already-installed-breaks-batch
+    match: { os_family: linux, package_manager: [yum] }
+    topic: install-idempotency
+    title: 安装不要自己算 skip/upgrade/install 三分支，交给 yum
+    facts:
+      - "基础镜像/存量系统常预装 zlib/pcre/perl 等；自算「已装同版本跳过、低版本升级」会在精确版本锁定处翻车（升级 libxml2 打断 libxml2-python）"
+      - "yum 的 install 语义本身就是惰性的：已装且满足要求的包不动，只有被真正要求换版本才升级；重复执行输出 Nothing to do 且退出码 0，幂等免费得到"
+    guidance: install 只声明目标包名交给 yum 求解，禁止自建 skip/upgrade/install 清单与裸批量 -Uvh
+    evidence: docs/reports/centos7-yum-localrepo-closure-20260925.md §2
+
+  - id: centos7-mysqld-direct-start
+    match: { os_id: [centos, rhel], os_version_range: ">=7,<8", package_manager: [yum] }
+    topic: mysql
+    title: el7 直启 mysqld 必须带 --user=mysql（root 下被主动拒绝）
+    facts:
+      - "以 root 执行 /usr/sbin/mysqld --daemonize 会被 MySQL 拒绝：Fatal error: Please read \"Security\" section of the manual to find out how to run mysqld as root!"
+      - "正确形态：/usr/sbin/mysqld --user=mysql --daemonize --pid-file=<pid>；pid/datadir 目录属主须为 mysql"
+      - "datadir 未初始化（未执行 --initialize）时同样启动不了——提示必须指向「需先初始化」，不能写成「未安装」"
+      - "A && B || C 在 POSIX sh 里是「A 失败或 B 失败都执行 C」；用它表达分支会把真实失败原因替换成错误结论（实测把「root 启动被拒」报成「mysqld 未安装」）"
+    guidance: 直启 mysqld 一律带 --user=mysql 并先确保 datadir 已初始化；分支用 if/else，失败提示必须与真实原因一致
+    evidence: docs/reports/centos7-yum-localrepo-closure-20260925.md §5
+
+  - id: archive-selfcheck-must-include-symlinks
+    match: { os_family: linux, package_manager: [yum] }
+    topic: package-source
+    title: 归档成员自检的期望集合必须含符号链接（JDK 自带 205 个软链）
+    facts:
+      - "Temurin JDK 包内 jdk/legal/<module>/{LICENSE,ASSEMBLY_EXCEPTION,ADDITIONAL_LICENSE_INFO} 全是指向 ../java.base/ 的符号链接，实测 205 个"
+      - "find rpms src jdk conf -type f 只列常规文件（417 条），tar -tzf 列出全部成员（623 条）——期望集合漏掉软链必然报「archive members mismatch」，实测同一诊断连续两轮无法收敛"
+      - "平台侧归档校验放行常规文件/目录/符号链接三类，但软链必须是相对路径且解析后仍在制品根内（绝对路径 exit 27、越狱 exit 29）"
+      - "MANIFEST.txt 仍只列常规文件：软链没有稳定的内容哈希，其正确性由「归档成员集合 + 软链目标安全」两项校验保证"
+    guidance: 期望集合用 find rpms src jdk conf \( -type f -o -type l \) 再拼 MANIFEST.txt；tar 侧过滤目录项后 LC_ALL=C sort 比较；自检失败必须打印 diff 前 20 行与两侧条数
+    evidence: docs/reports/centos7-yum-localrepo-closure-20260925.md §10
+
+  - id: kylin-v10-repo-sources
+    match: { os_id: [kylin], os_version_range: ">=10,<11", package_manager: [yum] }
+    topic: package-source
+    title: 银河麒麟 V10 的软件源与工具基线
+    facts:
+      - "源在 /etc/yum.repos.d/kylin_aarch64.repo，仓库为 ks10-adv-os / ks10-adv-updates / ks10-adv-addons，baseurl 形如 http://update.cs2c.com.cn:8080/NS/V10/V10SP3/os/adv/lic/base/$basearch/（实测 http 返回 302，跟随跳到 https 后 200；yum makecache 可用）"
+      - "**SP 号只出现在 repo baseurl 与 /etc/.kyinfo 的 milestone 里**：/etc/os-release 与 /etc/kylin-release 都只有 `V10 (Lance)`，SP1/SP2/SP3 共用该代号（实测 SP3 镜像与真机一致）——不要指望从 os-release 得到 SP"
+      - "包版本带发行版后缀：glibc-2.28-88.p09.ky10、openssl-libs-1.1.1f-15.p21.ky10（el7 是 .el7 后缀，别混用）"
+      - "精简镜像可能没装 diffutils（cmp/diff 都缺，实测），脚本的工具预检必须覆盖自己用到的命令，且比对文件优先用 sha256sum 而不是 cmp"
+      - "闭包解析要在 fetch 机上进行；fetch 机若就是同版本麒麟，可直接读 /etc/yum.repos.d/*.repo 复用其源，不要写死 CentOS vault 路径"
+    guidance: 麒麟目标的 fetch 用 ks10-adv-* 源（从目标机 repo 文件读取 baseurl，保留 $basearch）；脚本先做工具预检并在缺 cmp 时降级为 sha256sum 比对；判定 SP 读 repo baseurl 或 /etc/.kyinfo
+    evidence: docs/reports/kylin-v10-e2e-20260927.md
+
+  - id: kylin-v10-appstream-gated-packages
+    match: { os_id: [kylin], os_version_range: ">=10,<11", arch: [aarch64], package_manager: [yum] }
+    topic: package-source
+    title: mysql-server 等模块化软件不在麒麟免费源——必须 el8 上游 fallback 并落盘 repo
+    facts:
+      - "ks10-adv-os(lic/base) 与 ks10-adv-updates(lic/updates) 免费可达，但**不含 mysql-server/mysql、postgresql-server 等模块化软件**（实测 yum list available mysql\\* 仅 mysql-connector-java）；它们在需授权的 addons 段（repomd 404）"
+      - "erlang 在 ks10-adv-updates 有（21.3.3-7.p03.ky10）；nginx/redis 的模块化新版只在 el8 上游"
+      - "mysql-server 可行来源 = el8 兼容上游：mirrors.aliyun.com/almalinux/8/AppStream/aarch64/os（实测有 mysql-server 8.4.x 与 8.0.x、nginx 1.24、redis 6.2/7.x，包名带 module_el8 构建签名）"
+      - "el8 上游的模块包在麒麟（platform:el10 流）上被 dnf 模块过滤整段隐藏：repo 定义必须加 **module_hotfixes=1** 才可见可装（实测不加则 `Unable to find a match`）"
+      - "组件 fetch 在麒麟免费源 resolve 不到目标包时**必须 fallback 到 el8 上游 resolve**，并把所用上游 repo（含 module_hotfixes=1）写入 $ARTIFACT_DIR/conf/repos/——总入口闭包会收集该目录；直接 DEPLOY_FAIL 属于缺陷"
+    guidance: 组件 fetch 的 resolve 顺序固定为「kylin 免费源 → el8 兼容上游（aliyun alma8 AppStream+BaseOS，逐源 curl 预检）」；走上游时落盘 repo 文件到 conf/repos/ 且带 module_hotfixes=1
+    evidence: 2026-09-28 Kylin ARM64 双容器实测（脚本#55 任务#78/#79：v19 八组件 fetch 全过即走该 fallback；v20/v21 未写 fallback 反复失败）
+
+  - id: declared-version-may-be-major-only
+    match: { os_family: linux, package_manager: [yum] }
+    topic: closure-resolution
+    title: 研发声明的版本可能只是主版本，解析仓库必须按主版本前缀匹配
+    facts:
+      - "实测：声明 nginx 版本 1.21，仓库里是 1:1.21.5-2.p13.ky10（**带 epoch 前缀**）——脚本按 'nginx-1.21.' 精确匹配全部落空，连续 4 轮 fetch 失败（DEPLOY_FAIL: MISSING_ARTIFACT nginx 1.21. not in repos=…）"
+      - "rpm 的完整版本是 [epoch:]version-release；仓库索引/文件名里的 epoch 不一定出现，比较时必须两边都归一化"
+      - "声明版本与仓库版本不一致时，正确行为是取该主版本下的最新可用（1.21 → 1.21.*），并在 assumptions 里写明实际解析到的版本；解析不到才报错"
+    guidance: 版本解析按主版本前缀匹配并忽略 epoch（N:）前缀；解析结果写入脚本头部变量与 assumptions，禁止拿声明版本做精确串匹配
+    evidence: docs/reports/kylin-v10-e2e-20260927.md
+
+  - id: arch-check-must-allow-noarch
+    match: { os_family: linux, package_manager: [yum] }
+    topic: package-source
+    title: 架构校验白名单必须是「目标架构 ∪ noarch」，noarch 不是架构不符
+    facts:
+      - "el7 闭包里天然含 noarch 包（实测 basesystem-10.0-7.el7.centos.noarch.rpm，另有 ca-certificates/tzdata/nginx-filesystem 等），它们是必装依赖"
+      - "把架构校验写成「只允许 aarch64」会让 fetch 在自检阶段直接失败（实测脚本 #36 v1：ARCH_MISMATCH basesystem-…noarch.rpm，164MB 下载白跑）"
+      - "要拦的是异架构（x86_64/i386 混进 aarch64 目标），不是 noarch"
+    guidance: 架构校验写成 case "$a" in <目标架构>|noarch) 放行;; *) 报错（给出文件名与实际架构）;; esac
+    evidence: docs/reports/centos7-yum-localrepo-closure-20260925.md §9
+
+  - id: yum-list-available-excludes-installed
+    match: { os_family: linux, package_manager: [yum] }
+    topic: install-idempotency
+    title: 判定「本地仓库是否含某包」禁用 yum list available（它过滤已安装的包）
+    facts:
+      - "yum list available 只列「可安装」的包，已安装且同版本的包不会出现在输出里——用它做仓库成员预检，第一次安装通过、幂等重跑必误判为缺包（实测脚本#35 候选 v1/v2：第二次运行打印 MISSING nginx/mysql-community-server/redis 后 exit 1，而包就在 rpms/ 里）"
+      - "同一现象的基础镜像实测：rpms/ 有 157 个 rpm，容器内 yum list available 只列 88 个（其余为已装包）"
+      - "正确做法：不要预检仓库成员，直接把安装交给 yum install 并用退出码判定——幂等时输出 Nothing to do 且退出码 0；确需 dry-run 判定可满足性用 yum -y --setopt=tsflags=test install（实测完整闭包 exit 0、缺 jemalloc 时 exit 1 并打印精确缺口）"
+    guidance: 禁止用 yum list available/repoquery 结果判定本地仓库是否含目标包；安装一律直接 yum install 看退出码，dry-run 用 --setopt=tsflags=test
+    evidence: docs/reports/centos7-yum-localrepo-closure-20260925.md §7
+
+  - id: centos7-base-image-preinstalled
+    match: { os_id: [centos], os_version_range: ">=7,<8", package_manager: [yum] }
+    topic: base-environment
+    title: centos:7 容器基础镜像预装清单
+    facts:
+      - "预装 zlib 1.2.7 / pcre 8.32 / openssl-libs 1.0.2k-19 / perl 5.16 全家桶"
+      - "真实服务器通常更多（lsof/rsync/iproute 常见）——闭包在外网代理解析时携带了解析机的假设，目标机差异必须靠 install 侧的 yum 求解兼容（不要自算清单）"
+    guidance: 离线包宁可多备（目标机没有就装，已装且满足要求 yum 会跳过）；依赖判定交给目标机 yum
+    evidence: docs/reports/centos7-yum-localrepo-closure-20260925.md §2
+  - id: el8-mirrorlist-repos-ignored
+    match: { os_id: [almalinux, rockylinux, centos, rhel], os_version_range: ">=8,<9", package_manager: [yum] }
+    topic: package-source
+    title: el8 系默认 repo 用 mirrorlist 而 total_fetch 只解析 baseurl——仓库被静默忽略
+    facts:
+      - "almalinux:8 容器 /etc/yum.repos.d/almalinux.repo 默认激活的是 mirrorlist= 行，baseurl 行被注释——total_fetch 的仓库枚举只认 baseurl，mirrorlist 段被静默跳过"
+      - "结果：所有主源不注册，报 DEPLOY_FAIL: YUM_SOLVE no reachable yum repository sources，且 skipped repos 汇总在 fail 之后打印，日志看不到剔除明细"
+      - "repo.almalinux.org 官方源全量 repodata 镜像在此网络环境 180s 超时失败（单文件探测 200 且 1.6s，但 repodata 总量大）"
+    guidance: fetch 机准备阶段先把 el8 系 repo 从 mirrorlist 换成 baseurl 直链（国内推荐 mirrors.aliyun.com）：sed -i -e 's|^mirrorlist=|#mirrorlist=|' -e 's|^# baseurl=https://repo.almalinux.org|baseurl=https://mirrors.aliyun.com|' /etc/yum.repos.d/almalinux*.repo；rocky/centos 同理。2026-09-30 almalinux:8 aarch64 容器实测
+  - id: sed-custom-delimiter-mismatch
+    match: { os_family: [linux] }
+    topic: script-bug
+    title: s|...|...| 自定义分隔符 sed 必须恰好三个分隔符——跨 BSD/GNU sed 行为差异
+    facts:
+      - "sed 's|/AppStream/|/BaseOS/' 只有两个 |（结尾误用 /），GNU sed 4.5 报 unterminated `s' command；macOS BSD sed 容错可通过，sh -n 也不查 sed 语义"
+      - "该缺陷曾存在于 task_engine SoftwareScriptBundleAssembler.java 的 AppStream→BaseOS 镜像补全逻辑（2026-09-30 实测发现），已在 skill 模板中修复为 s|/AppStream/|/BaseOS|"
+    guidance: 生成或审查含自定义分隔符（| , # 等）的 sed 表达式时，强制数分隔符数量（s 命令恰 3 个）；跨平台脚本勿依赖 BSD sed 容错。skill validate_scripts.py 已加入该项检查
+  - id: mac-docker-mysql-family-limitation
+    match: { os_family: [linux], env: [docker-desktop-macos] }
+    topic: acceptance-env
+    title: Mac Docker (Apple Silicon) 无法执行 mysql 系二进制——验收环境边界而非脚本缺陷
+    facts:
+      - "MySQL 8 官方 mysql-server（在线安装亦然）execve mysqld 直接 Operation not permitted；--security-opt seccomp=unconfined 无效"
+      - "MariaDB 10.11 前台 --initialize-insecure 退出码 0 但静默截断：只建 InnoDB/Aria 底层文件（aria_log/ibdata1），无 mysql/ 系统库；有/无网卡同样失败，failed to retrieve MAC address 仅警告"
+      - "同环境 java-17/nginx/postgresql/rabbitmq/elasticsearch/redis 全部正常——仅 mysql 系异常"
+    guidance: 在 Mac Docker 上做 mysql8/mariadb 的 Docker 成对验收时，离线安装事务（rpm/deb 闭包与本地仓库安装）可完整验证，进程健康检查预期失败——判定为验收环境限制，需在真实 Linux 服务器复验进程级结果；不得据此改写正确的安装脚本。2026-09-30 almalinux:8/debian:12 aarch64 容器实测
+  - id: elasticsearch-runtime-constraints
+    match: { os_id: [almalinux, rockylinux, centos, rhel], package_manager: [yum] }
+    topic: service-startup
+    title: Elasticsearch rpm 三大运行时坑：PATH、yml 重复字段、JPMS 主类形态
+    facts:
+      - "/usr/share/elasticsearch/bin 不在默认 PATH，su 环境下 command -v elasticsearch 失败——必须绝对路径调用"
+      - "向 elasticsearch.yml 追加 xpack.security.enabled 会与既有/重跑内容形成 Duplicate field，ES 拒绝启动——应改用启动参数 -Expack.security.enabled=false（优先级高于 yml 且幂等）"
+      - "ES 8.19+ java 进程 cmdline 中主类为 JPMS 模块形式 server/org.elasticsearch.bootstrap.Elasticsearch（前侧是 / 非空格），空格全词匹配的进程探测会漏检——需子串匹配（total 模板 java_process_running 已修复）"
+      - "elastic 官方源 artifacts.elastic.co/packages/8.x/yum 为 noarch 平铺结构（无 $basearch 子目录），primary 元数据 .gz；mirror.elastic.co 在部分网络不可达"
+    guidance: ES 组件 install 用绝对路径 /usr/share/elasticsearch/bin/elasticsearch；关 security 用启动参数而非改 yml；进程健康检查扫 cmdline 子串。2026-09-30 ES 8.19.22 almalinux:8 aarch64 断网容器实测（进程+HTTP 9200 双验通过）

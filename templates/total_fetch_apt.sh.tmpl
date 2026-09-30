@@ -1,0 +1,145 @@
+#!/bin/sh
+set -eu
+SD=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+ARTIFACT_DIR=${ARTIFACT_DIR:-"$SD/artifacts"}
+export ARTIFACT_DIR
+fail() { printf 'DEPLOY_FAIL: %s %s\n' "$1" "$2" >&2; exit 1; }
+# total_fetch.sh（apt/dpkg 路线）— assemble_total.py 确定性生成，勿手改
+MODE=${1:-}
+case "$MODE" in ''|--finalize-only|--dry-run|--rollback) ;; *) fail CONFIG_APPLY 'unknown option' ;; esac
+mkdir -p "$ARTIFACT_DIR/rpms" "$ARTIFACT_DIR/debs" "$ARTIFACT_DIR/src" "$ARTIFACT_DIR/jdk" "$ARTIFACT_DIR/conf"
+run_fetch() {
+  slug=$1; shift
+  printf '[component] fetch %s begin\n' "$slug"
+  if sh "$SD/${slug}_fetch.sh" "$@"; then
+    printf '[component] fetch %s ok\n' "$slug"
+  else
+    rc=$?
+    printf 'DEPLOY_FAIL: CONFIG_APPLY fetch component %s exited %s\n' "$slug" "$rc" >&2
+    exit "$rc"
+  fi
+}
+if [ "$MODE" = --rollback ]; then
+@@COMPONENT_ROLLBACK_FETCH_CALLS@@
+  exit 0
+fi
+if [ "$MODE" != --finalize-only ]; then
+@@COMPONENT_FETCH_CALLS@@
+fi
+[ "$MODE" = --dry-run ] && exit 0
+#@@BEGIN_CLOSURE@@
+# 组件 fetch 用 apt-cache 读取系统 APT 索引；索引陈旧时会把可解析的包误报为不存在，先刷新
+if [ "$MODE" != --finalize-only ] && [ "$MODE" != --rollback ]; then
+  apt-get update || fail APT_SOLVE 'apt-get update failed before component fetch'
+fi
+TARGET_OS_ID='@@TARGET_OS_ID@@'
+TARGET_OS_VERSION='@@TARGET_OS_VERSION@@'
+TARGET_ARCH='@@TARGET_ARCH@@'
+PACKAGE_NAMES='@@PACKAGE_NAMES@@'
+command -v apt-get >/dev/null 2>&1 || fail APT_SOLVE 'apt-get unavailable on fetch host'
+command -v dpkg >/dev/null 2>&1 || fail APT_SOLVE 'dpkg unavailable on fetch host'
+[ -r /etc/os-release ] || fail APT_SOLVE 'fetch host OS identity unavailable'
+. /etc/os-release
+CURRENT_OS_ID=$(printf '%s' "${ID:-unknown}" | tr '[:upper:]' '[:lower:]')
+[ "$CURRENT_OS_ID" = "$TARGET_OS_ID" ] \
+  || fail APT_SOLVE 'fetch host OS ID does not match target profile'
+version_key() {
+  value=$(printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  case "$value" in V*|v*) value=${value#?} ;; esac
+  printf '%s' "$value"
+}
+TARGET_VERSION_KEY=$(version_key "$TARGET_OS_VERSION")
+CURRENT_VERSION_KEY=$(version_key "${VERSION_ID:-}")
+[ -n "$TARGET_VERSION_KEY" ] && [ "$CURRENT_VERSION_KEY" = "$TARGET_VERSION_KEY" ] \
+  || fail APT_SOLVE 'fetch host OS version does not match target profile'
+case "$TARGET_ARCH" in
+  x86_64|amd64) APT_ARCH=amd64 ;;
+  aarch64|arm64) APT_ARCH=arm64 ;;
+  i386|i486|i586|i686) APT_ARCH=i386 ;;
+  armv7l|armhf) APT_ARCH=armhf ;;
+  *) APT_ARCH=$TARGET_ARCH ;;
+esac
+[ "$(dpkg --print-architecture)" = "$APT_ARCH" ] \
+  || fail APT_SOLVE 'fetch host architecture does not match target profile'
+# dpkg-scanpackages 缺失时直接失败：fetch 阶段禁止未声明的目标机包变更，
+# 不自动安装 dpkg-dev（预装指引见错误信息）
+command -v dpkg-scanpackages >/dev/null 2>&1 \
+  || fail APT_SOLVE 'dpkg-scanpackages unavailable: preinstall dpkg-dev on the fetch host first (apt-get install dpkg-dev)'
+# debs/ is manager-owned. Drop only stale package files and index before resolving
+# the current closure; preserve component artifacts in every other directory.
+for stale_deb in "$ARTIFACT_DIR/debs/"*.deb; do
+  [ -f "$stale_deb" ] || [ -L "$stale_deb" ] || continue
+  rm -f "$stale_deb" || fail APT_SOLVE 'removing stale .deb failed'
+done
+rm -f "$ARTIFACT_DIR/debs/Packages" "$ARTIFACT_DIR/debs/Packages.gz" \
+  || fail REPO_METADATA 'removing stale APT index failed'
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/envprobe-apt.XXXXXX") || fail CONFIG_APPLY 'mktemp failed'
+trap 'rm -rf "$WORK"' 0
+trap 'exit 1' 1 2 3 15
+mkdir -p "$WORK/lists/partial" "$WORK/cache/archives/partial" "$WORK/cache/archives"
+: > "$WORK/status"
+apt-get -o APT::Architecture="$APT_ARCH" \
+  -o Dir::State::status="$WORK/status" -o Dir::State::lists="$WORK/lists" \
+  -o Dir::Cache::archives="$WORK/cache/archives" update \
+  || fail APT_SOLVE 'target apt repositories failed to refresh'
+# 空 dpkg 状态令 APT 按全新目标解析完整强依赖闭包。
+# shellcheck disable=SC2086
+apt-get -o APT::Architecture="$APT_ARCH" \
+  -o Dir::State::status="$WORK/status" -o Dir::State::lists="$WORK/lists" \
+  -o Dir::Cache::archives="$WORK/cache/archives" \
+  --download-only --reinstall --no-install-recommends -y install $PACKAGE_NAMES \
+  || fail APT_SOLVE 'empty-status target .deb dependency closure failed'
+found=0
+for deb in "$WORK/cache/archives/"*.deb; do
+  [ -f "$deb" ] || continue
+  cp -f "$deb" "$ARTIFACT_DIR/debs/${deb##*/}" || fail APT_SOLVE 'copying .deb failed'
+  found=1
+done
+[ "$found" -eq 1 ] || fail APT_SOLVE 'APT closure produced no .deb files'
+(cd "$ARTIFACT_DIR/debs" && dpkg-scanpackages --arch "$APT_ARCH" . /dev/null > Packages) \
+  || fail REPO_METADATA 'dpkg-scanpackages failed'
+gzip -9n -c "$ARTIFACT_DIR/debs/Packages" > "$ARTIFACT_DIR/debs/Packages.gz" \
+  || fail REPO_METADATA 'compressing APT package index failed'
+[ -s "$ARTIFACT_DIR/debs/Packages.gz" ] || fail REPO_METADATA 'APT package index is empty'
+#@@END_CLOSURE@@
+if [ -z "$(find "$ARTIFACT_DIR/rpms" "$ARTIFACT_DIR/debs" "$ARTIFACT_DIR/src" "$ARTIFACT_DIR/jdk" "$ARTIFACT_DIR/conf" -type f -print -quit)" ]; then
+  fail MISSING_ARTIFACT 'planned artifacts were not produced'
+fi
+artifact_root=$(cd "$ARTIFACT_DIR" && pwd -P) || fail MANIFEST 'artifact root unavailable'
+find "$ARTIFACT_DIR/rpms" "$ARTIFACT_DIR/debs" "$ARTIFACT_DIR/src" "$ARTIFACT_DIR/jdk" "$ARTIFACT_DIR/conf" -type l -print |
+  while IFS= read -r link; do
+    target=$(readlink "$link") || exit 1
+    case "$target" in /*) exit 1 ;; esac
+    resolved=$(realpath -m "$link") || exit 1
+    case "$resolved" in "$artifact_root"/*) ;; *) exit 1 ;; esac
+  done || fail MANIFEST 'unsafe artifact symlink'
+(cd "$ARTIFACT_DIR" &&
+  find rpms debs src jdk conf -type f -print | LC_ALL=C sort |
+  while IFS= read -r file; do sha256sum "$file"; done
+) > "$ARTIFACT_DIR/MANIFEST.txt" || fail MANIFEST 'hash generation failed'
+[ -s "$ARTIFACT_DIR/MANIFEST.txt" ] || fail MANIFEST 'empty manifest'
+(cd "$ARTIFACT_DIR" && sha256sum -c MANIFEST.txt >/dev/null) \
+  || fail MANIFEST 'manifest validation failed'
+tar -czf "$SD/fetch-artifacts.tar.gz" -C "$ARTIFACT_DIR" \
+  rpms debs src jdk conf MANIFEST.txt || fail MANIFEST 'archive creation failed'
+members=$(mktemp "${TMPDIR:-/tmp}/envprobe-members.XXXXXX") || fail MANIFEST 'mktemp failed'
+expected=$(mktemp "${TMPDIR:-/tmp}/envprobe-expected.XXXXXX") || fail MANIFEST 'mktemp failed'
+@@TRAP_LINE@@
+tar -tzf "$SD/fetch-artifacts.tar.gz" | sed '/\/$/d' | LC_ALL=C sort > "$members" \
+  || fail MANIFEST 'archive listing failed'
+(cd "$ARTIFACT_DIR" &&
+  find rpms debs src jdk conf \( -type f -o -type l \) -print && printf 'MANIFEST.txt\n'
+) | LC_ALL=C sort > "$expected" || fail MANIFEST 'expected member listing failed'
+expected_hash=$(sha256sum "$expected" | awk '{print $1}')
+actual_hash=$(sha256sum "$members" | awk '{print $1}')
+if [ "$expected_hash" != "$actual_hash" ]; then
+  printf 'expected_count=%s archive_count=%s\n' \
+    "$(wc -l < "$expected")" "$(wc -l < "$members")" >&2
+  awk 'NR==FNR { seen[$0]=1; next } !($0 in seen) { print "extra " $0 }' \
+    "$expected" "$members" | sed -n '1,20p' >&2
+  awk 'NR==FNR { seen[$0]=1; next } !($0 in seen) { print "missing " $0 }' \
+    "$members" "$expected" | sed -n '1,20p' >&2
+  fail MANIFEST 'archive member set mismatch'
+fi
+printf 'Deliver fetch-artifacts.tar.gz and the complete script bundle together.\n'
+@@SUMMARY_LINES@@
