@@ -237,3 +237,39 @@ entries:
       - "ES 8.19+ java 进程 cmdline 中主类为 JPMS 模块形式 server/org.elasticsearch.bootstrap.Elasticsearch（前侧是 / 非空格），空格全词匹配的进程探测会漏检——需子串匹配（total 模板 java_process_running 已修复）"
       - "elastic 官方源 artifacts.elastic.co/packages/8.x/yum 为 noarch 平铺结构（无 $basearch 子目录），primary 元数据 .gz；mirror.elastic.co 在部分网络不可达"
     guidance: ES 组件 install 用绝对路径 /usr/share/elasticsearch/bin/elasticsearch；关 security 用启动参数而非改 yml；进程健康检查扫 cmdline 子串。2026-09-30 ES 8.19.22 almalinux:8 aarch64 断网容器实测（进程+HTTP 9200 双验通过）
+  - id: el8-el9-repo-layout-variants
+    match: { os_id: [almalinux, rockylinux], os_version_range: ">=8,<10", package_manager: [yum] }
+    topic: package-source
+    title: el8/9 各发行版 repo 文件布局互不相同——mirrorlist 换 baseurl 的 sed 每家一套
+    facts:
+      - "almalinux:8：单文件 almalinux.repo，段内 mirrorlist 激活 + 注释 baseurl（sed 启用注释行并指向阿里云即可）"
+      - "almalinux:9：分文件 almalinux-{appstream,baseos,extras}.repo，只有 mirrorlist 无注释 baseurl——须按文件名注入对应 baseurl（AppStream/BaseOS/extras/CRB）"
+      - "rockylinux:8：分文件 Rocky-*.repo 带 #baseurl=http://dl.rockylinux.org/$contentdir 注释行——替换域名为 mirrors.aliyun.com/rockylinux"
+      - "rockylinux:9：单文件 rocky.repo 多段（[baseos]/[appstream] 无空行分隔）——须按段名范围替换（sed '/^\\[baseos\\]/,/^[/ s|^mirrorlist=.*|baseurl=...|'）"
+      - "total_fetch 只解析 baseurl，mirrorlist 段被静默忽略：不换源必报 no reachable yum repository sources"
+    guidance: fetch 机准备按发行版选择换源命令（四套 sed 见 facts）；换源后 grep 验证 baseurl 行存在。2026-10-06 四镜像实测
+  - id: minimal-images-missing-findutils
+    match: { os_id: [rockylinux, openeuler], package_manager: [yum] }
+    topic: fetch-host-prep
+    title: rocky/openeuler 官方容器缺 find 与 createrepo_c——total 制品检查误判零制品
+    facts:
+      - "rockylinux:8/9、openeuler 22.03 容器无 find/createrepo_c；total_fetch 的空制品检查用 find，命令缺失时命令替换得空串，[ -z ] 误判为真 → MISSING_ARTIFACT 'planned artifacts were not produced'（闭包实际已下载 102+ 包）"
+      - "find 失败只往 stderr 打 command not found，主日志最显著行是 MISSING_ARTIFACT，极易误诊为闭包问题"
+    guidance: fetch 机准备基线必须包含 dnf -y install findutils createrepo_c（同 dpkg-dev 之于 apt）；遇到 MISSING_ARTIFACT 且 rpms/ 有包时优先排查 find 是否存在。2026-10-06 实测
+  - id: debian11-eol-archive-source
+    match: { os_id: [debian], os_version_range: ">=11,<12", package_manager: [apt] }
+    topic: package-source
+    title: Debian 11 bullseye 已结束 LTS（2026-08）——官方镜像池退役中索引与文件不一致
+    facts:
+      - "2026-10 实测：各官方镜像 bullseye-security 索引仍列旧版本（如 perl deb11u5/libtiff u8），pool 已清理 → apt 安装大量 404"
+      - "archive.debian.org 冻结归档索引池一致可用；国内可达镜像：mirror.nju.edu.cn/debian-archive（华为云/清华无此目录）"
+      - "归档源 Release 过期，apt 需 [check-valid-until=no] + -o Acquire::Check-Valid-Until=false"
+    guidance: debian 11 目标一律用 debian-archive 归档源（check-valid-until=no），并在 fetch 机准备时预装 dpkg-dev。2026-10-06 实测
+  - id: mariadb-el7-layout-and-init
+    match: { os_id: [centos, rhel], os_version_range: ">=7,<8", package_manager: [yum] }
+    topic: service-startup
+    title: MariaDB 5.5（el7 vault）二进制在 libexec 且初始化用 mysql_install_db
+    facts:
+      - "服务端二进制是 /usr/libexec/mysqld，不在 PATH（command -v mysqld 失败）"
+      - "MariaDB 5.5 不支持 --initialize-insecure（MySQL 5.7+ 参数），初始化须用 mysql_install_db --user=mysql"
+    guidance: mariadb 组件 install 先定位二进制（command -v mysqld 或 /usr/libexec/mysqld），初始化优先 mysql_install_db、失败才回退 --initialize-insecure。2026-10-06 centos7 vault 实测（152 rpm 闭包断网安装 mysqld 进程验证通过）

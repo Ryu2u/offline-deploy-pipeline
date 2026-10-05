@@ -53,3 +53,9 @@ total_install 已通过 yum（本地 RPM 仓库）或 `apt-get --no-download`（
 - mysqld 必须 `--user=mysql` 启动（gotcha 既有条目）；容器无 systemd 时 `mysqld --user=mysql` 后台拉起 + `mysqladmin -uroot ping` 等待循环（initialize-insecure 后 root 无密码）
 - PostgreSQL（debian）：postinst 已自动 initdb，容器内用 `pg_ctlcluster 15 main start`；健康检查 `pg_isready -q`
 - RabbitMQ：erlang 启动 10-40s，健康等待循环 ≥60s；进程名 beam.smp
+
+## 多发行版实测补充（2026-10-06，10 OS 矩阵）
+
+- **redis 包名差异**：el8/9 仓库服务包名是 `redis`（redis-server 是文件不是包），deb 系是 `redis-server`——bundle 包名按路线区分
+- **fetch 机准备基线**：apt 系预装 dpkg-dev；rocky/openeuler 预装 findutils createrepo_c；el8/9 系按发行版换源（见 gotchas el8-el9-repo-layout-variants）；debian 11 用 archive 归档源
+- **ubuntu 画像 os_version 为主版本**（22）而 fetch 机 VERSION_ID 带点版本（22.04）——apt 模板已改主版本匹配，生成 bundle 时直接用画像值即可

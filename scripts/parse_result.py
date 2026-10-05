@@ -111,6 +111,9 @@ def parse_section(raw: str):
                 continue
         break
     content_lines = lines[idx:]
+    # END 后可能跟尾随空行（部分发行版 sh 的输出差异），先剥空行再剥 END
+    while content_lines and content_lines[-1] == "":
+        content_lines.pop()
     if content_lines and content_lines[-1] == "### END":
         content_lines = content_lines[:-1]
     if meta.get("encoding") == "b64" and content_lines:

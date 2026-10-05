@@ -50,8 +50,16 @@ version_key() {
 }
 TARGET_VERSION_KEY=$(version_key "$TARGET_OS_VERSION")
 CURRENT_VERSION_KEY=$(version_key "${VERSION_ID:-}")
-[ -n "$TARGET_VERSION_KEY" ] && [ "$CURRENT_VERSION_KEY" = "$TARGET_VERSION_KEY" ] \
-  || fail APT_SOLVE 'fetch host OS version does not match target profile'
+# ubuntu 画像 os_version 为主版本（22），宿主 VERSION_ID 带点版本（22.04）：
+# 同主版本即视为匹配（2026-10 ubuntu 实测，原字面相等校验必失败）
+if [ -n "$TARGET_VERSION_KEY" ]; then
+  if [ "$CURRENT_VERSION_KEY" != "$TARGET_VERSION_KEY" ]; then
+    case "$CURRENT_VERSION_KEY" in
+      "$TARGET_VERSION_KEY".*) : ;;
+      *) fail APT_SOLVE 'fetch host OS version does not match target profile' ;;
+    esac
+  fi
+fi
 case "$TARGET_ARCH" in
   x86_64|amd64) APT_ARCH=amd64 ;;
   aarch64|arm64) APT_ARCH=arm64 ;;
