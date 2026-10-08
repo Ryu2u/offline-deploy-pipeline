@@ -4,7 +4,7 @@
 # 每条 = 一个实战验证过的事实/坑。新增条目须经双容器实证（docs/reports/ 有对应报告）。
 # 版本：kb_version 随内容演进，注入 prompt 时携带以便审计。
 
-kb_version: 2026.09.28.4
+kb_version: 2026.10.08.1
 
 entries:
   - id: centos7-aarch64-package-availability
@@ -273,3 +273,15 @@ entries:
       - "服务端二进制是 /usr/libexec/mysqld，不在 PATH（command -v mysqld 失败）"
       - "MariaDB 5.5 不支持 --initialize-insecure（MySQL 5.7+ 参数），初始化须用 mysql_install_db --user=mysql"
     guidance: mariadb 组件 install 先定位二进制（command -v mysqld 或 /usr/libexec/mysqld），初始化优先 mysql_install_db、失败才回退 --initialize-insecure。2026-10-06 centos7 vault 实测（152 rpm 闭包断网安装 mysqld 进程验证通过）
+  - id: apt-locale-localized-output
+    match: { os_family: linux, package_manager: [apt] }
+    topic: script-robustness
+    title: 非英文 locale 下 apt 工具输出被本地化——文本解析必落空，判定一律退出码或 LC_ALL=C
+    facts:
+      - "麒麟 V11 桌面默认中文 locale：apt-cache policy 的 Candidate: 行实际输出为『候选:』——组件 fetch 用 sed -n 's/^  Candidate: //p' 匹配落空，把源内实际存在的包误报 PKG_MISSING（2026-10-08 keyidea-pc 真实机实测：openjdk-21-jdk 候选 21.0.3+9-ok1 明明存在仍报缺包）"
+      - "退出码判定不受 locale 影响：dpkg -s、systemctl is-active --quiet、apt-get 事务、sha256sum -c 均可靠"
+      - "df -P（portability 格式）禁用千位分隔符，数字列安全；systemctl list-unit-files 的单元名在行首且是文件系统事实，安全"
+      - "协议/格式常量不受影响：redis-cli PONG（协议回复值）、java -version 的 version \"21（OpenJDK 硬编码格式串）"
+      - "客户端工具的消息文本理论可本地化（如 mysqladmin 的 mysqld is alive），grep 输出文本做健康判定不可靠"
+    guidance: 解析 apt/dpkg 文本输出必须加 LC_ALL=C 前缀（如 LC_ALL=C apt-cache policy）；健康检查与存在性判定优先用退出码而非 grep 输出文本（mysqladmin ping 用退出码，不 grep alive）。适用于任何 apt 系非英文 locale 目标（麒麟/统信/深度等）
+    evidence: 2026-10-08 Kylin V11 x86_64 真实机 keyidea-pc fetch 实测（预检误报修复后四包闭包正常解析）
